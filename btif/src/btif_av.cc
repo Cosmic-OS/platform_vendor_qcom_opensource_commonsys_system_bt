@@ -82,8 +82,14 @@
 #include "btif_bat.h"
 #include "bta/av/bta_av_int.h"
 #include "device/include/device_iot_config.h"
+#if (OFF_TARGET_TEST_ENABLED == FALSE)
 #include "audio_hal_interface/a2dp_encoding.h"
+#endif
 #include "controller.h"
+#if (OFF_TARGET_TEST_ENABLED == TRUE)
+#include "log/log.h"
+#include "service/a2dp_hal_sim/audio_a2dp_hal_stub.h"
+#endif
 
 extern bool isDevUiReq;
 bool isBitRateChange = false;
@@ -183,6 +189,7 @@ typedef struct {
   bool offload_state;
 #if (TWS_STATE_ENABLED == TRUE)
   uint8_t eb_state;
+  bool tws_state_suspend;
 #endif
 #endif
   bool avdt_sync; /* for AVDT1.3 delay reporting */
@@ -322,6 +329,7 @@ bool btif_av_current_device_is_tws(void);
 bool btif_av_is_idx_tws_device(int index);
 int btif_av_get_tws_pair_idx(int index);
 bool btif_av_is_tws_enable_monocfg(void);
+bool btif_av_is_tws_pair_remote_started(int index);
 #else
 #define btif_av_is_tws_device_playing() 0
 #define btif_av_is_tws_suspend_triggered() 0
@@ -331,6 +339,7 @@ bool btif_av_is_tws_enable_monocfg(void);
 #define btif_av_is_idx_tws_device() 0
 #define btif_av_get_tws_pair_idx() 0
 #define btif_av_is_tws_enable_monocfg() 0
+#define btif_av_is_tws_pair_remote_started() 0
 #endif
 #if (TWS_ENABLED == TRUE)
 #if (TWS_STATE_ENABLED == TRUE)
@@ -467,6 +476,7 @@ static void btif_initiate_av_open_timer_timeout(void* data) {
   RawAddress peer_addr;
   btif_av_connect_req_t connect_req;
   RawAddress *bd_add = (RawAddress *)data;
+  if (bd_add == nullptr) return;
   BTIF_TRACE_DEBUG("%s: bd_add: %s", __func__, bd_add->ToString().c_str());
 
   memset(&connect_req, 0, sizeof(btif_av_connect_req_t));
@@ -609,6 +619,7 @@ static void btif_update_source_codec(void* p_data) {
       codec_config = current_codec->getCodecConfig();
       if(codec_config.codec_type == BTAV_A2DP_CODEC_INDEX_SOURCE_APTX_ADAPTIVE) {
         int index = btif_max_av_clients;
+        int tws_index = btif_max_av_clients;
         uint16_t encoder_mode = req->codec_config.codec_specific_4 & APTX_MODE_MASK;
 
         if (btif_av_stream_started_ready())
@@ -618,21 +629,37 @@ static void btif_update_source_codec(void* p_data) {
 
         if(index >= btif_max_av_clients) return;
 
+        if(btif_av_cb[index].tws_device) {
+          tws_index = btif_av_get_tws_pair_idx(index);
+        }
+
         if(encoder_mode == APTX_HQ) {
           btif_av_cb[index].aptx_mode = APTX_HQ;
           btif_av_cb[index].codec_latency = APTX_HQ_LATENCY;
+          if(tws_index < btif_max_av_clients) {
+            btif_av_cb[tws_index].aptx_mode = APTX_HQ;
+            btif_av_cb[tws_index].codec_latency = APTX_HQ_LATENCY;
+          }
           btif_a2dp_update_sink_latency_change();
           BTIF_TRACE_DEBUG("%s: Aptx Adaptive mode = %d, codec_latency = %d", __func__,
                         btif_av_cb[index].aptx_mode, btif_av_cb[index].codec_latency);
         } else if (encoder_mode == APTX_LL) {
           btif_av_cb[index].aptx_mode = APTX_LL;
           btif_av_cb[index].codec_latency = APTX_LL_LATENCY;
+          if(tws_index < btif_max_av_clients) {
+            btif_av_cb[tws_index].aptx_mode = APTX_LL;
+            btif_av_cb[tws_index].codec_latency = APTX_LL_LATENCY;
+          }
           btif_a2dp_update_sink_latency_change();
           BTIF_TRACE_DEBUG("%s: Aptx Adaptive mode = %d, codec_latency = %d", __func__,
                         btif_av_cb[index].aptx_mode, btif_av_cb[index].codec_latency);
         } else if (encoder_mode == APTX_ULL) {
           btif_av_cb[index].aptx_mode = APTX_ULL;
           btif_av_cb[index].codec_latency = APTX_ULL_LATENCY;
+          if(tws_index < btif_max_av_clients) {
+            btif_av_cb[tws_index].aptx_mode = APTX_ULL;
+            btif_av_cb[tws_index].codec_latency = APTX_ULL_LATENCY;
+          }
           btif_a2dp_update_sink_latency_change();
           BTIF_TRACE_DEBUG("%s: Aptx Adaptive mode = %d, codec_latency = %d", __func__,
                         btif_av_cb[index].aptx_mode, btif_av_cb[index].codec_latency);
@@ -888,6 +915,7 @@ static bool btif_av_state_idle_handler(btif_sm_event_t event, void* p_data, int 
       btif_av_cb[index].offload_state = false;
 #if (TWS_STATE_ENABLED == TRUE)
       btif_av_cb[index].eb_state = 0;
+      btif_av_cb[index].tws_state_suspend = false;
 #endif
 #endif
       btif_av_cb[index].aptx_mode = APTX_HQ;
@@ -1276,6 +1304,14 @@ static bool btif_av_state_opening_handler(btif_sm_event_t event, void* p_data,
 #if (TWS_ENABLED == TRUE)
         BTIF_TRACE_DEBUG("is tws_device = %d",p_bta_data->open.tws_device);
         btif_av_cb[index].tws_device = p_bta_data->open.tws_device;
+        if (btif_av_cb[index].tws_device) {
+          int idx = btif_av_get_tws_pair_idx(index);
+          if (idx < btif_max_av_clients) {
+            btif_av_cb[index].aptx_mode = btif_av_cb[idx].aptx_mode;
+            BTIF_TRACE_DEBUG("Updating aptx mode to second connected earbud: %d",
+                          btif_av_cb[index].aptx_mode);
+          }
+        }
 #endif
         if (p_bta_data->open.edr & BTA_AV_EDR_3MBPS) {
           BTIF_TRACE_DEBUG("remote supports 3 mbps");
@@ -1719,8 +1755,10 @@ static bool btif_av_state_opened_handler(btif_sm_event_t event, void* p_data,
         APPL_TRACE_DEBUG("TWS+ device enter opened state");
         for(int i = 0; i < btif_max_av_clients; i++) {
           if (i != index && btif_av_cb[i].tws_device &&
-              (btif_av_cb[i].flags & BTIF_AV_FLAG_PENDING_START)) {
-            APPL_TRACE_DEBUG("The other TWS+ is pending start, sending bta av start");
+              (btif_av_cb[i].flags & BTIF_AV_FLAG_PENDING_START) &&
+              !(btif_av_cb[i].flags & BTIF_AV_FLAG_LOCAL_SUSPEND_PENDING)) {
+            APPL_TRACE_DEBUG("The other TWS+ is pending start, sending bta av start, flags %x",
+                              btif_av_cb[i].flags);
             btif_av_cb[index].flags |= BTIF_AV_FLAG_PENDING_START;
             BTA_AvStart(btif_av_cb[index].bta_handle);
           }
@@ -1781,10 +1819,14 @@ static bool btif_av_state_opened_handler(btif_sm_event_t event, void* p_data,
              */
             for (; idx < btif_max_av_clients; idx++)
 #if (TWS_ENABLED == TRUE)
-              if (btif_av_cb[idx].tws_device)
+              if (btif_av_cb[idx].tws_device) {
+                if (!tws_state_supported ||
+                  (tws_state_supported &&
+                  btif_av_cb[idx].eb_state == TWSP_STATE_IN_EAR))
                 btif_av_cb[idx].flags |= BTIF_AV_FLAG_PENDING_START;
-              else if (enable_multicast == true)
+              } else if (enable_multicast == true) {
                 btif_av_cb[idx].flags |= BTIF_AV_FLAG_PENDING_START;
+              }
 #else
               btif_av_cb[idx].flags |= BTIF_AV_FLAG_PENDING_START;
 #endif
@@ -1860,7 +1902,8 @@ static bool btif_av_state_opened_handler(btif_sm_event_t event, void* p_data,
           if (enable_multicast
 #if (TWS_ENABLED == TRUE)
               || ((btif_av_cb[index].tws_device == true)
-              &&  (btif_av_is_tws_device_playing(index) == true))
+              &&  ((btif_av_is_tws_device_playing(index) == true) &&
+                    btif_av_is_tws_pair_remote_started(index) == false) )
 #endif
           ) {
             /* Stack will start the playback on newly connected
@@ -1896,7 +1939,7 @@ static bool btif_av_state_opened_handler(btif_sm_event_t event, void* p_data,
               if(!btif_av_cb[index].remote_started) {
                 BTIF_TRACE_DEBUG("%s: honor remote start on index %d",__func__, index);
                 btif_av_cb[index].remote_started = true;
-                btif_a2dp_honor_remote_start(btif_av_cb[index].remote_start_alarm, index);
+                btif_a2dp_honor_remote_start(&btif_av_cb[index].remote_start_alarm, index);
               }
             }
           }
@@ -2468,7 +2511,14 @@ static bool btif_av_state_started_handler(btif_sm_event_t event, void* p_data,
           "pending_cmd: %d, dual_handoff: %d,  fake_suspend_rsp: %d", __func__, index,
        p_av->suspend.status, p_av->suspend.initiator, btif_av_cb[index].flags, pending_cmd,
        btif_av_cb[index].dual_handoff, btif_av_cb[index].fake_suspend_rsp);
-
+#if (TWS_ENABLED == TRUE && TWS_STATE_ENABLED == TRUE)
+      if (tws_state_supported && btif_av_cb[index].tws_device &&
+        btif_av_cb[index].tws_state_suspend) {
+        BTIF_TRACE_EVENT("%s:Suspending out of ear EB",__func__);
+        btif_av_cb[index].flags |= BTIF_AV_FLAG_LOCAL_SUSPEND_PENDING;
+        btif_av_cb[index].tws_state_suspend = false;
+      }
+#endif
       if (alarm_is_scheduled(btif_av_cb[index].suspend_rsp_track_timer)) {
         BTIF_TRACE_DEBUG("%s: BTA_AV_SUSPEND_EVT is received, clear suspend_rsp_track_timer",
                              __func__);
@@ -2892,6 +2942,7 @@ static void btif_av_handle_event(uint16_t event, char* p_param) {
       /* 1. SetActive Device -> Null */
       if (*bt_addr == RawAddress::kEmpty)
       {
+        int streaming_index = INVALID_INDEX;
         for(int i = 0; i < btif_max_av_clients; i++)
         {
           if (btif_av_cb[i].current_playing == TRUE)
@@ -2903,12 +2954,20 @@ static void btif_av_handle_event(uint16_t event, char* p_param) {
             btif_av_get_addr_by_index(previous_active_index))) {
             BTIF_TRACE_IMP("Device -> Null, btif_a2dp_source_end_session failed");
           }
-          if (previous_active_index < btif_max_av_clients &&
-            btif_av_get_latest_stream_device_idx() == previous_active_index) {
-            BTIF_TRACE_IMP("Send suspend to previous active streaming device & stop media alarm");
-            btif_sm_dispatch(btif_av_cb[previous_active_index].sm_handle,
+          streaming_index =  btif_av_get_latest_stream_device_idx();
+          if (previous_active_index < btif_max_av_clients) {
+            if (streaming_index == previous_active_index) {
+              BTIF_TRACE_IMP("Send suspend to previous active streaming device & stop media alarm");
+              btif_sm_dispatch(btif_av_cb[previous_active_index].sm_handle,
                              BTIF_AV_SUSPEND_STREAM_REQ_EVT, NULL);
-            btif_a2dp_source_stop_audio_req();
+              btif_a2dp_source_stop_audio_req();
+            } else if (streaming_index < btif_max_av_clients &&
+                    streaming_index == btif_av_get_tws_pair_idx(previous_active_index)) {
+               BTIF_TRACE_IMP("Send suspend to streaming device which is pair of previously active device");
+               btif_sm_dispatch(btif_av_cb[streaming_index].sm_handle,
+                              BTIF_AV_SUSPEND_STREAM_REQ_EVT, NULL);
+               btif_a2dp_source_stop_audio_req();
+            }
           }
           btif_av_signal_session_ready();
         }
@@ -3822,6 +3881,20 @@ void btif_av_event_deep_copy(uint16_t event, char* p_dest, char* p_src) {
          BTIF_TRACE_DEBUG("%s: event: %d, size: %d", __func__, event, sizeof(uint8_t));
          maybe_non_aligned_memcpy(av_dest_offload_start_or_stop_rsp,
                                      av_src_offload_start_or_stop_rsp, sizeof(uint8_t));
+         break;
+      }
+
+      case BTA_AV_RC_COLL_DETECTED_EVT: //26
+      {
+         tBTA_AV_RC_COLL_DETECTED* av_src_av_rc_collision_detect =
+                                                 (tBTA_AV_RC_COLL_DETECTED*)p_src;
+         tBTA_AV_RC_COLL_DETECTED* av_dest_av_rc_collision_detect =
+                                                 (tBTA_AV_RC_COLL_DETECTED*)p_dest;
+         BTIF_TRACE_DEBUG("%s: event: %d, size: %d", __func__, event,
+                                      sizeof(*av_src_av_rc_collision_detect));
+         maybe_non_aligned_memcpy(av_dest_av_rc_collision_detect,
+                                  av_src_av_rc_collision_detect,
+                                  sizeof(*av_src_av_rc_collision_detect));
          break;
       }
 
@@ -5756,6 +5829,12 @@ void btif_av_set_earbud_state(const RawAddress& address, uint8_t earbud_state) {
     BTIF_TRACE_ERROR("%s: invalid index",__func__);
     return;
   }
+  if (earbud_state == TWSP_STATE_OUT_OF_EAR &&
+    btif_av_cb[index].eb_state == 0 &&
+    btif_av_cb[index].state == BTIF_AV_STATE_STARTED) {
+    BTIF_TRACE_ERROR("%s:streaming started for reconn,suspending",__func__);
+    btif_av_cb[index].tws_state_suspend = true;
+  }
   btif_av_cb[index].eb_state = earbud_state;
   BTA_AVSetEarbudState(earbud_state, btif_av_cb[index].bta_handle);
 #endif
@@ -5820,9 +5899,10 @@ bool btif_av_is_multicast_supported() {
 }
 
 bool btif_av_check_flag_remote_suspend(int index) {
-  BTIF_TRACE_ERROR("%s(): index = %d",__func__, index);
-  if (index >= btif_max_av_clients || index < 0)
+  if (index >= btif_max_av_clients || index < 0) {
+    BTIF_TRACE_ERROR("%s(): Invalid index = %d",__func__, index);
     return false;
+  }
   if (btif_av_cb[index].flags & BTIF_AV_FLAG_REMOTE_SUSPEND) {
     BTIF_TRACE_DEBUG("remote suspend flag set on index = %d",index);
     return true;
@@ -6018,6 +6098,20 @@ bool btif_av_is_tws_device_playing(int index) {
     if (i != index && state == BTIF_AV_STATE_STARTED) {
       if (btif_av_cb[i].tws_device) {
         BTIF_TRACE_EVENT("btif_av_is_tws_device_playing on index = %d",i);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+bool btif_av_is_tws_pair_remote_started(int index) {
+  int i;
+  btif_sm_state_t state = BTIF_AV_STATE_IDLE;
+  for (i = 0; i < btif_max_av_clients; i++) {
+    state = btif_sm_get_state(btif_av_cb[i].sm_handle);
+    if (i != index && state == BTIF_AV_STATE_STARTED) {
+      if (btif_av_cb[i].tws_device && btif_av_cb[i].remote_started) {
+        BTIF_TRACE_EVENT("%s: on index = %d",__func__,i);
         return true;
       }
     }
@@ -6415,7 +6509,6 @@ void btif_av_set_offload_status() {
     BTIF_TRACE_IMP("restart with software session");
   }
   reconfig_a2dp = FALSE;
-  btif_media_send_reset_vendor_state();
 }
 
 void btif_av_set_reconfig_flag(tBTA_AV_HNDL bta_handle) {

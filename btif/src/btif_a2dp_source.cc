@@ -24,6 +24,8 @@
 #define LOG_TAG "bt_btif_a2dp_source"
 #define ATRACE_TAG ATRACE_TAG_AUDIO
 
+#include "bt_target.h"
+
 #include <base/logging.h>
 #ifndef OS_GENERIC
 #include <cutils/trace.h>
@@ -33,7 +35,16 @@
 #include <algorithm>
 
 #include "audio_a2dp_hw/include/audio_a2dp_hw.h"
+#if (OFF_TARGET_TEST_ENABLED == FALSE)
 #include "audio_hal_interface/a2dp_encoding.h"
+#endif
+
+#if (OFF_TARGET_TEST_ENABLED == TRUE)
+#include "service/a2dp_hal_sim/audio_a2dp_hal.h"
+#include "service/a2dp_hal_sim/audio_a2dp_hal_stub.h"
+using ::bluetooth::audio::a2dp::SessionType;
+#endif
+
 #include "bt_common.h"
 #include "bta_av_ci.h"
 #include "btif_a2dp.h"
@@ -146,7 +157,6 @@ extern int btif_max_av_clients;
 extern int btif_get_is_remote_started_idx();
 extern bool audio_start_awaited;
 extern void btif_av_reset_reconfig_flag();
-extern bool reconfig_a2dp;
 extern bool btif_av_is_remote_started_set(int index);
 extern tBTA_AV_HNDL btif_av_get_av_hdl_from_idx(int idx);
 extern bool enc_update_in_progress;
@@ -352,9 +362,8 @@ int btif_a2dp_source_last_remote_start_index() {
 
 void btif_a2dp_source_cancel_remote_start() {
   if (btif_a2dp_source_cb.remote_start_alarm != NULL) {
-    alarm_free(btif_a2dp_source_cb.remote_start_alarm);
-    btif_a2dp_source_cb.remote_start_alarm = NULL;
     btif_av_clear_remote_start_timer(btif_a2dp_source_cb.last_remote_started_index);
+    btif_a2dp_source_cb.remote_start_alarm = NULL;
     APPL_TRACE_DEBUG("%s: cancel remote start on AV index %d",
         __func__, btif_a2dp_source_cb.last_remote_started_index);
     btif_a2dp_source_cb.last_remote_started_index = -1;
@@ -390,11 +399,15 @@ static void btif_a2dp_source_remote_start_timeout(UNUSED_ATTR void* context) {
   return;
 }
 
-void btif_a2dp_source_on_remote_start(struct alarm_t *remote_start_alarm, int index) {
+void btif_a2dp_source_on_remote_start(struct alarm_t **remote_start_alarm, int index) {
   // initiate remote start timer for index basis
   int *arg = NULL;
   arg = (int *) osi_malloc(sizeof(int));
-  remote_start_alarm = alarm_new("btif.remote_start_task");
+  if (remote_start_alarm == NULL) {
+    LOG_ERROR(LOG_TAG,"%s:remote start alarm is NULL",__func__);
+    return;
+  }
+  *remote_start_alarm = alarm_new("btif.remote_start_task");
   if (!remote_start_alarm || !arg) {
     LOG_ERROR(LOG_TAG,"%s:unable to allocate media alarm",__func__);
     btif_av_clear_remote_start_timer(index);
@@ -402,9 +415,9 @@ void btif_a2dp_source_on_remote_start(struct alarm_t *remote_start_alarm, int in
     return;
   }
   *arg = index;
-  alarm_set(remote_start_alarm, BTIF_REMOTE_START_TOUT,
+  alarm_set(*remote_start_alarm, BTIF_REMOTE_START_TOUT,
             btif_media_remote_start_alarm_cb, (void *)arg);
-  btif_a2dp_source_cb.remote_start_alarm = remote_start_alarm;
+  btif_a2dp_source_cb.remote_start_alarm = *remote_start_alarm;
   btif_a2dp_source_cb.last_remote_started_index = index;
   btif_a2dp_source_cb.last_started_index_pointer = arg;
   APPL_TRACE_DEBUG("%s: Remote start timer started index %d arg %d",
@@ -1592,6 +1605,19 @@ bool btif_a2dp_source_end_session(const RawAddress& peer_address) {
         system_bt_osi::DISCONNECT_REASON_UNKNOWN, 0);
   }
 
+  /* request to stop media task */
+  if (!btif_a2dp_source_is_hal_v2_enabled() ||
+       (btif_a2dp_source_is_hal_v2_enabled() &&
+       bluetooth::audio::a2dp::get_session_type() ==
+       SessionType::A2DP_SOFTWARE_ENCODING_DATAPATH)) {
+    if (btif_a2dp_source_cb.tx_flush == false)
+      btif_a2dp_source_cb.tx_flush = true;
+
+    btif_a2dp_source_audio_tx_flush_req();
+    BTIF_TRACE_DEBUG("%s: stop audio as it is SW session",__func__);
+    btif_a2dp_source_stop_audio_req();
+  }
+
   if (btif_a2dp_source_is_hal_v2_enabled()) {
     bluetooth::audio::a2dp::end_session();
   }
@@ -1691,6 +1717,14 @@ void btif_a2dp_source_process_request(tA2DP_CTRL_CMD cmd) {
           APPL_TRACE_WARNING("%s: remote a2dp started, cancel \
                        remote start timer", __func__);
           btif_a2dp_source_cancel_remote_start();
+          if (reset_remote_start) {
+            int index = btif_av_get_tws_pair_idx(remote_start_idx);
+            if (index < btif_max_av_clients &&
+              btif_av_is_remote_started_set(index)) {
+              APPL_TRACE_WARNING("%s:Clear remote start for tws pair index",__func__);
+              btif_av_clear_remote_start_timer(index);
+            }
+          }
           btif_dispatch_sm_event(
                     BTIF_AV_RESET_REMOTE_STARTED_FLAG_UPDATE_AUDIO_STATE_EVT,
                     &remote_start_idx, sizeof(remote_start_idx));
@@ -1752,6 +1786,9 @@ void btif_a2dp_source_process_request(tA2DP_CTRL_CMD cmd) {
               /*Return pending and ack when start stream cfm received from remote*/
               status = A2DP_CTRL_ACK_PENDING;
             }
+          } else if (reconfig_a2dp) {
+            APPL_TRACE_DEBUG("%s: wait for reconfig to complete ",__func__);
+            status = A2DP_CTRL_ACK_LONG_WAIT_ERR;
           } else {
             APPL_TRACE_DEBUG("%s: respond with success as already started",__func__);
             if (!btif_av_is_split_a2dp_enabled() && !btif_a2dp_source_is_streaming())
@@ -1770,16 +1807,20 @@ void btif_a2dp_source_process_request(tA2DP_CTRL_CMD cmd) {
               btif_dispatch_sm_event(BTIF_AV_START_STREAM_REQ_EVT, NULL, 0);
             }
             status = A2DP_CTRL_ACK_PENDING;
+          } else if (remote_start_idx < btif_max_av_clients &&
+            reset_remote_start && btif_av_current_device_is_tws()) {
+            uint8_t hdl = 0;
+            int pair_index = remote_start_idx;
+            if (remote_start_flag) {
+            //Both the earbuds are are remote started, fetch index pair to send offload req
+              pair_index = btif_av_get_tws_pair_idx(latest_playing_idx);
+            }
+            hdl = btif_av_get_av_hdl_from_idx(pair_index);
+            APPL_TRACE_DEBUG("Start VSC exchange for remote started index of \
+                                          TWS+ device");
+            btif_dispatch_sm_event(BTIF_AV_OFFLOAD_START_REQ_EVT, (char *)&hdl, 1);
+            status = A2DP_CTRL_ACK_PENDING;
           }
-          break;
-        } else if (remote_start_idx < btif_max_av_clients &&
-          reset_remote_start && btif_av_current_device_is_tws()) {
-          uint8_t hdl = 0;
-          hdl = btif_av_get_av_hdl_from_idx(remote_start_idx);
-          APPL_TRACE_DEBUG("Start VSC exchange for remote started index of \
-                                      TWS+ device");
-          btif_dispatch_sm_event(BTIF_AV_OFFLOAD_START_REQ_EVT, (char *)&hdl, 1);
-          status = A2DP_CTRL_ACK_PENDING;
 #endif
           break;
         }
